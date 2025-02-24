@@ -60,4 +60,189 @@
 #
 # {'type': 'metrics', 'dataset': 'train', 'r2': 0.8, 'mse': 0.7, 'mad': 0.9}
 # {'type': 'metrics', 'dataset': 'test', 'r2': 0.7, 'mse': 0.6, 'mad': 0.8}
-#
+import os
+import json
+import gzip
+import pickle
+from glob import glob
+
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error, median_absolute_error
+
+
+def get_datasets():
+    """
+    Carga los datos de entrenamiento y prueba desde archivos comprimidos.
+    """
+    train_df = pd.read_csv(
+        "./files/input/train_data.csv.zip",
+        compression="zip",
+        index_col=False,
+    )
+    test_df = pd.read_csv(
+        "./files/input/test_data.csv.zip",
+        compression="zip",
+        index_col=False,
+    )
+    return train_df, test_df
+
+
+def preprocess(df):
+    """
+    Realiza el preprocesamiento de los datos:
+    - Crea la columna 'Age' a partir de la diferencia entre 2021 y 'Year'.
+    - Elimina las columnas 'Year' y 'Car_Name'.
+    """
+    df_processed = df.copy()
+    base_year = 2021
+    df_processed["Age"] = base_year - df_processed["Year"]
+    df_processed = df_processed.drop(columns=["Year", "Car_Name"])
+    return df_processed
+
+
+def separate_features_target(df):
+    """
+    Separa el dataframe en variables predictoras (X) y la variable objetivo (y).
+    Se asume que la columna 'Present_Price' es la variable a pronosticar.
+    """
+    X = df.drop(columns=["Present_Price"])
+    y = df["Present_Price"]
+    return X, y
+
+
+def build_pipeline(X):
+    """
+    Construye un pipeline de preprocesamiento y modelo que incluye:
+    - Transformación de variables categóricas con OneHotEncoder.
+    - Escalado de variables numéricas en el rango [0, 1].
+    - Selección de las K mejores características mediante SelectKBest y f_regression.
+    - Modelo de regresión lineal.
+    
+    Se identifican las columnas categóricas y numéricas a partir del dataset.
+    """
+    cat_vars = ["Fuel_Type", "Selling_type", "Transmission"]
+    num_vars = [col for col in X.columns if col not in cat_vars]
+
+    transformer = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), cat_vars),
+            ("num", MinMaxScaler(), num_vars),
+        ]
+    )
+
+    model_pipeline = Pipeline(
+        steps=[
+            ("preprocessor", transformer),
+            ("feature_selection", SelectKBest(score_func=f_regression)),
+            ("classifier", LinearRegression()),
+        ]
+    )
+    return model_pipeline
+
+
+def get_grid_search(estimator):
+    """
+    Define y retorna un GridSearchCV para optimizar:
+    - La cantidad de características a seleccionar (k entre 1 y 11).
+    - Los parámetros 'fit_intercept' y 'positive' del modelo de regresión lineal.
+    
+    Se utiliza validación cruzada de 10 particiones y la métrica de error absoluto medio negativo.
+    """
+    parameters = {
+        "feature_selection__k": range(1, 12),
+        "classifier__fit_intercept": [True, False],
+        "classifier__positive": [True, False],
+    }
+    grid = GridSearchCV(
+        estimator=estimator,
+        param_grid=parameters,
+        cv=10,
+        scoring="neg_mean_absolute_error",
+        n_jobs=-1,
+        refit=True,
+        verbose=1,
+    )
+    return grid
+
+
+def ensure_directory(path):
+    """
+    Crea el directorio especificado. Si ya existe, lo elimina y lo vuelve a crear.
+    """
+    if os.path.exists(path):
+        for file in glob(os.path.join(path, "*")):
+            os.remove(file)
+        os.rmdir(path)
+    os.makedirs(path)
+
+
+def export_model(model, filepath):
+    """
+    Guarda el modelo optimizado en formato comprimido con gzip.
+    Se asegura de que el directorio 'files/models/' exista y esté limpio.
+    """
+    model_dir = os.path.dirname(filepath)
+    ensure_directory(model_dir)
+    with gzip.open(filepath, "wb") as f:
+        pickle.dump(model, f)
+
+
+def compute_metrics(y_true, y_pred, dataset_label):
+    """
+    Calcula y retorna un diccionario con las métricas r2, MSE y error absoluto mediano.
+    """
+    metrics = {
+        "type": "metrics",
+        "dataset": dataset_label,
+        "r2": float(r2_score(y_true, y_pred)),
+        "mse": float(mean_squared_error(y_true, y_pred)),
+        "mad": float(median_absolute_error(y_true, y_pred)),
+    }
+    return metrics
+
+
+def main():
+    # Cargar y preprocesar datos
+    train_df, test_df = get_datasets()
+    train_df = preprocess(train_df)
+    test_df = preprocess(test_df)
+
+    # Separar variables predictoras y objetivo
+    X_train, y_train = separate_features_target(train_df)
+    X_test, y_test = separate_features_target(test_df)
+
+    # Construir pipeline y configurar búsqueda de hiperparámetros
+    pipe = build_pipeline(X_train)
+    grid_search = get_grid_search(pipe)
+
+    # Entrenar el modelo con GridSearchCV
+    grid_search.fit(X_train, y_train)
+
+    # Guardar el modelo entrenado
+    export_model(grid_search, os.path.join("files", "models", "model.pkl.gz"))
+
+    # Realizar predicciones y calcular métricas
+    pred_train = grid_search.predict(X_train)
+    pred_test = grid_search.predict(X_test)
+
+    metrics_train = compute_metrics(y_train, pred_train, "train")
+    metrics_test = compute_metrics(y_test, pred_test, "test")
+
+    # Guardar las métricas en archivo JSON (una línea por conjunto)
+    output_dir = os.path.join("files", "output")
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_filepath = os.path.join(output_dir, "metrics.json")
+    with open(metrics_filepath, "w", encoding="utf-8") as f:
+        f.write(json.dumps(metrics_train) + "\n")
+        f.write(json.dumps(metrics_test) + "\n")
+
+
+if __name__ == "__main__":
+    main()
